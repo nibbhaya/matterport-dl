@@ -23,6 +23,8 @@ import hashlib
 import platform
 
 import shutil
+import glob
+import time
 import sys
 from typing import Any, ClassVar, cast
 from dataclasses import dataclass
@@ -44,8 +46,8 @@ if sys.platform == "win32":
 
 BASE_MATTERPORTDL_DIR = pathlib.Path(__file__).resolve().parent
 SCRIPT_NAME = os.path.basename(sys.argv[0])
-MAX_CONCURRENT_REQUESTS = 20  # cffi will make sure no more than this many curl workers are used at once
-MAX_CONCURRENT_TASKS = 64  # while we could theoretically leave this unbound just relying on MAX_CONCURRENT_REQESTS there is little reason to spawn a million tasks at once
+MAX_CONCURRENT_REQUESTS = 4  # cffi will make sure no more than this many curl workers are used at once
+MAX_CONCURRENT_TASKS = 8  # while we could theoretically leave this unbound just relying on MAX_CONCURRENT_REQESTS there is little reason to spawn a million tasks at once
 
 BASE_MATTERPORT_DOMAIN = "matterport.com"
 CHINA_MATTERPORT_DOMAIN = "matterportvr.cn"
@@ -162,7 +164,9 @@ def getVariants():
     global SWEEP_DO_4K
     # to be smart we should be using the GetShowcaseSweeps file and data.model.locations[4].pano.resolutions  to determine if we should be trying 2k or 4k
     depths = ["512", "1k", "2k"]
-    if SWEEP_DO_4K:
+    if CLA.getCommandLineArg(CommandLineArg.SKIP_2K_TILES):
+        depths = ["512", "1k"]
+    elif SWEEP_DO_4K:
         depths.append("4k")
     for depth in range(len(depths)):
         z = depths[depth]
@@ -231,11 +235,10 @@ async def downloadFileWithJSONPost(type, shouldExist, url, file, post_json_str, 
 
     reqId = logUrlDownloadStart(type, file, url, descriptor, shouldExist, key_type=AccessKeyType.PrimaryKey)
     try:
-        resp: requests.Response = await OUR_SESSION.request(url=url, method="POST", headers={"Content-Type": "application/json"}, data=bytes(post_json_str, "utf-8"))
+        resp: requests.Response = await RATE_LIMITER.request("POST", url, headers={"Content-Type": "application/json"}, data=bytes(post_json_str, "utf-8"))
         resp.raise_for_status()
         # req.add_header('Content-Length', len(body_bytes))
-        async with aiofiles.open(file, "wb") as the_file:
-            await the_file.write(resp.content)
+        await writeFileAtomic(file, resp.content)
         logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId)
     except Exception as ex:
         logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId, ex)
@@ -275,6 +278,119 @@ async def downloadFileAndGetText(type, shouldExist, url, file, post_data=None, i
             return await f.read()
 
 
+class PoliteRateLimiter:
+    """Respects the CDN's rate limits instead of hammering it.
+
+    - Spaces out request starts by MIN_INTERVAL seconds.
+    - On HTTP 429/503 pauses ALL requests (not just the one that failed) for the server's Retry-After,
+      or an exponential backoff (30s, 60s, 120s ... up to MAX_BACKOFF) on consecutive rate limits. Retrying
+      individual requests while others keep going just keeps the limit tripped.
+    - Tells the user on the console when it is pausing so a pause does not look like a hang.
+    """
+
+    MIN_INTERVAL = 0.2  # starting seconds between request starts (~5 req/s max); doubled after every rate limit
+    MAX_INTERVAL = 5.0
+    MAX_BACKOFF = 2 * 60 * 60  # honor the server's Retry-After (Matterport sends up to 3600s); retrying during a known block is pointless
+    MAX_ATTEMPTS = 12
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._next_start = 0.0
+        self._paused_until = 0.0
+        self._consecutive = 0
+        self._interval = self.MIN_INTERVAL
+
+    async def _wait_turn(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            async with self._lock:
+                now = loop.time()
+                start = max(now, self._next_start, self._paused_until)
+                self._next_start = start + self._interval
+            if start > now:
+                await asyncio.sleep(start - now)
+            if loop.time() >= self._paused_until:  # a pause may have started while we waited; if so wait again
+                return
+
+    def _on_rate_limited(self, response, url):
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._paused_until:
+            return  # another request already triggered this pause
+        self._consecutive += 1
+        retryAfter = response.headers.get("Retry-After", "")
+        backoff = min(30 * 2 ** (self._consecutive - 1), self.MAX_BACKOFF)
+        delay = min(float(retryAfter), self.MAX_BACKOFF) if retryAfter.replace(".", "", 1).isdigit() else backoff
+        delay = max(delay, 5)
+        self._paused_until = loop.time() + delay
+        self._next_start = self._paused_until
+        # Each time we trip the limit we were going too fast: halve the request rate for the rest of the run.
+        self._interval = min(self._interval * 2, self.MAX_INTERVAL)
+        msg = f"Matterport is rate limiting downloads (HTTP {response.status_code}); pausing all downloads for {int(delay)}s then continuing at {1 / self._interval:.1f} requests/s (server Retry-After: {retryAfter or 'not sent'})... resumes at {time.strftime('%H:%M:%S', time.localtime(time.time() + delay))}"
+        logging.warning(f"{msg} url: {url}")
+        std_tqdm.write(msg)
+
+    async def get(self, url):
+        return await self.request("GET", url)
+
+    async def request(self, method, url, **kwargs):
+        for attempt in range(self.MAX_ATTEMPTS):
+            await self._wait_turn()
+            response = await OUR_SESSION.request(method=method, url=url, **kwargs)
+            if response.status_code not in (429, 503) or attempt == self.MAX_ATTEMPTS - 1:
+                if response.status_code < 400:
+                    self._consecutive = 0
+                return response
+            self._on_rate_limited(response, url)
+        return response
+
+
+RATE_LIMITER: PoliteRateLimiter = None  # created in SetupSession
+
+
+async def writeFileAtomic(file, content: bytes):
+    """Write to a temp file then rename, so an interrupted run (Ctrl+C) never leaves a truncated file that later runs would skip as 'already downloaded'."""
+    tmp = f"{file}.part"
+    async with aiofiles.open(tmp, "wb") as f:
+        await f.write(content)
+    os.replace(tmp, file)
+
+
+KNOWN_MISSING_FILE = "known_missing.txt"
+KNOWN_MISSING: set[str] | None = None
+
+
+def _knownMissingKey(file):
+    root = globals().get("THIS_MODEL_ROOT_DIR")
+    if not root:
+        return None
+    return os.path.relpath(os.path.abspath(file), root)
+
+
+def isKnownMissing(file):
+    """Files that returned 404 on a previous run (ie tiles for sweeps that don't exist); skipped on reruns so resuming doesn't spend rate-limited requests on them again. Delete known_missing.txt in the model folder to retry them."""
+    global KNOWN_MISSING
+    key = _knownMissingKey(file)
+    if key is None:
+        return False
+    if KNOWN_MISSING is None:
+        KNOWN_MISSING = set()
+        path = os.path.join(THIS_MODEL_ROOT_DIR, KNOWN_MISSING_FILE)
+        if os.path.exists(path):
+            with open(path, "r", encoding="UTF-8") as f:
+                KNOWN_MISSING = {line.strip() for line in f if line.strip()}
+    return key in KNOWN_MISSING
+
+
+def markKnownMissing(file):
+    key = _knownMissingKey(file)
+    if key is None or (KNOWN_MISSING is not None and key in KNOWN_MISSING):
+        return
+    if KNOWN_MISSING is not None:
+        KNOWN_MISSING.add(key)
+    with open(os.path.join(THIS_MODEL_ROOT_DIR, KNOWN_MISSING_FILE), "a", encoding="UTF-8") as f:
+        f.write(key + "\n")
+
+
 # Add type parameter, shortResourcePath, shouldExist
 async def downloadFile(type, shouldExist, url, file, post_data=None, always_download=False, key_type: AccessKeyType = AccessKeyType.PrimaryKey):
     global MAX_TASKS_SEMAPHORE, OUR_SESSION
@@ -297,12 +413,16 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
         if not CLA.getCommandLineArg(CommandLineArg.DOWNLOAD) or (os.path.exists(file) and not always_download):  # skip already downloaded files except always download ones which are genreally ones that may contain keys?
             logUrlDownloadSkipped(type, file, url, "")
             return
+        if not always_download and isKnownMissing(file):
+            logUrlDownloadSkipped(type, file, url, "known 404 from a previous run")
+            return
         reqId = logUrlDownloadStart(type, file, url, "", shouldExist, key_type=key_type)
         try:
-            response = await OUR_SESSION.get(url)
+            response = await RATE_LIMITER.get(url)
+            if response.status_code == 404 and not always_download:
+                markKnownMissing(file)
             response.raise_for_status()  # Raise an exception if the response has an error status code
-            async with aiofiles.open(file, "wb") as f:
-                await f.write(response.content)
+            await writeFileAtomic(file, response.content)
             logUrlDownloadFinish(type, file, url, "", shouldExist, reqId)
             return
         except Exception as err:
@@ -485,7 +605,7 @@ async def downloadAssets(base, base_page_text):
     font_files = ["ibm-plex-sans-100", "ibm-plex-sans-100italic", "ibm-plex-sans-200", "ibm-plex-sans-200italic", "ibm-plex-sans-300", "ibm-plex-sans-300italic", "ibm-plex-sans-500", "ibm-plex-sans-500italic", "ibm-plex-sans-600", "ibm-plex-sans-600italic", "ibm-plex-sans-700", "ibm-plex-sans-700italic", "ibm-plex-sans-italic", "ibm-plex-sans-regular", "mp-font", "roboto-100", "roboto-100italic", "roboto-300", "roboto-300italic", "roboto-500", "roboto-500italic", "roboto-700", "roboto-700italic", "roboto-900", "roboto-900italic", "roboto-italic", "roboto-regular"]
 
     # extension assumed to be .png unless it is .svg or .jpg, for anything else place it in assets
-    image_files = ["360_placement_pin_mask", "chrome", "Desktop-help-play-button.svg", "Desktop-help-spacebar", "edge", "escape", "exterior", "exterior_hover", "firefox", "interior", "interior_hover", "matterport-logo-light.svg", "matterport-logo.svg", "mattertag-disc-128-free.v1", "mobile-help-play-button.svg", "nav_help_360", "nav_help_click_inside", "nav_help_gesture_drag", "nav_help_gesture_drag_two_finger", "nav_help_gesture_pinch", "nav_help_gesture_position", "nav_help_gesture_position_two_finger", "nav_help_gesture_tap", "nav_help_inside_key", "nav_help_keyboard_all", "nav_help_keyboard_left_right", "nav_help_keyboard_up_down", "nav_help_mouse_click", "nav_help_mouse_ctrl_click", "nav_help_mouse_drag_left", "nav_help_mouse_drag_right", "nav_help_mouse_position_left", "nav_help_mouse_position_right", "nav_help_mouse_zoom", "nav_help_tap_inside", "nav_help_zoom_keys", "NoteColor", "pinAnchor", "safari", "scope.svg", "showcase-password-background.jpg", "surface_grid_planar_256", "vert_arrows", "headset-quest-2", "tagColor", "matterport-app-icon.svg"]
+    image_files = ["360_placement_pin_mask", "chrome", "Desktop-help-play-button.svg", "Desktop-help-spacebar", "edge", "escape", "exterior", "exterior_hover", "firefox", "interior", "interior_hover", "matterport-logo-light.svg", "matterport-logo.svg", "mattertag-disc-128-free.v1", "mobile-help-play-button.svg", "nav_help_360", "nav_help_click_inside", "nav_help_gesture_drag", "nav_help_gesture_drag_two_finger", "nav_help_gesture_pinch", "nav_help_gesture_position", "nav_help_gesture_position_two_finger", "nav_help_gesture_tap", "nav_help_inside_key", "nav_help_keyboard_all", "nav_help_keyboard_left_right", "nav_help_keyboard_up_down", "nav_help_mouse_click", "nav_help_mouse_ctrl_click", "nav_help_mouse_drag_left", "nav_help_mouse_drag_right", "nav_help_mouse_position_left", "nav_help_mouse_position_right", "nav_help_mouse_zoom", "nav_help_tap_inside", "nav_help_zoom_keys", "NoteColor", "pinAnchor", "safari", "scope.svg", "showcase-password-background.jpg", "surface_grid_planar_256", "vert_arrows", "headset-quest-2", "tagColor", "matterport-app-icon.svg", "atlas", "logo-white.svg", "matterport-logo-white-r.svg"]
 
     assets = ["js/browser-check.js", "css/showcase.css", "css/packages-nova-ui.css", "css/scene.css", "css/unsupported_browser.css", "cursors/grab.png", "cursors/grabbing.png", "cursors/zoom-in.png", "cursors/zoom-out.png", "locale/strings.json", "css/ws-blur.css", "css/core.css", "css/late.css"]
 
@@ -535,7 +655,8 @@ async def downloadAssets(base, base_page_text):
     if showcase_runtime_filename is None:
         raise Exception("In all js files found on the page could not find any that have showcase and runtime in the filename for the showcase runtime js file")
     if react_vendor_filename is None:
-        raise Exception("In all js files found on the page could not find any that have vendors-react in the filename for the react vendor js file")
+        # Newer showcase builds no longer ship a separate vendors-react file (react is bundled elsewhere). The react patch below is optional; we search all downloaded js for it after download.
+        logging.warning("Could not find a vendors-react js file on the page, will search all downloaded js for the react src patch instead")
     await downloadFile("STATIC_ASSET", True, "https://matterport.com/nextjs-assets/images/favicon.ico", "favicon.ico")  # mainly to avoid the 404, always matterport.com
     showcase_cont = await downloadFileAndGetText(typeDict[showcase_runtime_filename], True, base + showcase_runtime_filename, showcase_runtime_filename, always_download=CLA.getCommandLineArg(CommandLineArg.REFRESH_KEY_FILES))
 
@@ -578,15 +699,22 @@ async def downloadAssets(base, base_page_text):
         raise Exception("Unable to extract js files and css files from showcase runtime js file")
     groupDict = match.groupdict()
     jsNamedDict = extractJSDict("showcase-runtime.js: namedJSFiles", groupDict["namedJSFiles"])
-    jsKeyDict = extractJSDict("showcase-runtime.js: JSFileToKey", groupDict["JSFileToKey"])
     cssNamedDict = extractJSDict("showcase-runtime.js: namedCSSFiles", groupDict["namedCSSFiles"])
     cssKeyDict = extractJSDict("showcase-runtime.js: CSSFileToKey", groupDict["CSSFileToKey"])
 
+    # Newer showcase builds dropped the content hash from chunk names (js/<name>.js instead of js/<name>.<hash>.js), so there is no key dict and unnamed chunks are not listed in the runtime at all; they get discovered by crawling chunk references after download.
+    hashlessChunks = "{" not in groupDict["JSFileToKey"]
+    if hashlessChunks:
+        jsKeyDict = {number: None for number in list(jsNamedDict.keys()) + list(cssKeyDict.keys())}
+    else:
+        jsKeyDict = extractJSDict("showcase-runtime.js: JSFileToKey", groupDict["JSFileToKey"])
+
+    def chunkFileName(number: str, key):
+        name = jsNamedDict.get(number, number)
+        return f"js/{name}.js" if key is None else f"js/{name}.{key}.js"
+
     for number, key in jsKeyDict.items():
-        name = number
-        if name in jsNamedDict:
-            name = jsNamedDict[name]
-        file = f"js/{name}.{key}.js"
+        file = chunkFileName(number, key)
         typeDict[file] = "SHOWCASE_DISCOVERED_JS"
         assets.append(file)
 
@@ -623,6 +751,42 @@ async def downloadAssets(base, base_page_text):
         shouldExist = True
         toDownload.append(AsyncDownloadItem(type, shouldExist, f"{base}{asset}", local_file))
     await AsyncArrayDownload(toDownload)
+
+    if hashlessChunks:
+        # Crawl downloaded js for dynamic chunk loads like x.e(1234) and fetch any chunks not yet downloaded, repeating until nothing new turns up.
+        knownChunks = set(jsKeyDict.keys())
+        scanned: set[str] = set()
+        while True:
+            newChunks: set[str] = set()
+            for jsFile in glob.glob("js/*.js"):
+                if jsFile in scanned or ".modified." in jsFile:
+                    continue
+                scanned.add(jsFile)
+                with open(jsFile, "r", encoding="UTF-8", errors="ignore") as f:
+                    jsCont = f.read()
+                newChunks.update(re.findall(r"[\w$]\.e\((\d+)\)", jsCont))
+                # webpack async context maps (ie locale yaml files): "./showcase_en-US.yaml":[moduleId,chunkId,...]
+                for ids in re.findall(r'"\./[^"]+":\[(\d+(?:,\d+)+)\]', jsCont):
+                    newChunks.update(ids.split(",")[1:])
+            newChunks -= knownChunks
+            if not newChunks:
+                break
+            knownChunks |= newChunks
+            consoleLog(f"Downloading {len(newChunks)} additional js chunks discovered in showcase code...")
+            toDownload = []
+            for number in newChunks:
+                file = chunkFileName(number, None)
+                toDownload.append(AsyncDownloadItem("SHOWCASE_DISCOVERED_JS", False, f"{base}{file}", file))
+            await AsyncArrayDownload(toDownload)
+
+    if react_vendor_filename is None:
+        for jsFile in glob.glob("js/*.js"):
+            if ".modified." in jsFile:
+                continue
+            with open(jsFile, "r", encoding="UTF-8", errors="ignore") as f:
+                if "(t.src=s.src)" in f.read():
+                    react_vendor_filename = jsFile
+                    break
     if react_vendor_filename and os.path.exists(react_vendor_filename):
         reactCont = ""
         with open(react_vendor_filename, "r", encoding="UTF-8") as f:
@@ -755,6 +919,54 @@ async def downloadPics(pageid):
     for image in modeldata["images"]:
         toDownload.append(AsyncDownloadItem("MODEL_IMAGES", True, image["src"], urlparse(image["src"]).path[1:]))  # want want to use signed_src or download_url?
     await AsyncArrayDownload(toDownload)
+
+
+def limitSweepResolutionsToDownloaded():
+    """Edit the served (modified) sweep data so each panorama only advertises resolutions whose tiles are all on disk.
+
+    Without this, the offline viewer requests 2k/4k tiles that were skipped (--skip-2k-tiles) or failed, getting 404s
+    and possibly blank panoramas. Panoramas that do have every tile of a resolution keep it.
+    """
+    srcFile = "api/mp/models/graph_GetShowcaseSweeps.json"
+    if not os.path.exists(srcFile):
+        return
+    try:
+        with open(srcFile, "r", encoding="UTF-8") as f:
+            data = json.loads(f.read())
+        locations = data["data"]["model"]["locations"]
+    except Exception as ex:
+        logging.warning(f"Unable to parse {srcFile} to limit sweep resolutions: {ex}")
+        return
+    removed = 0
+    for location in locations:
+        pano = location.get("pano") or {}
+        keep = []
+        for skybox in pano.get("skyboxes", []):
+            template = skybox.get("tileUrlTemplate", "")
+            tileCount = skybox.get("tileCount") or 1
+            if not template:
+                keep.append(skybox)
+                continue
+            localTemplate = urlparse(template).path[1:]
+            if not CLA.getCommandLineArg(CommandLineArg.TILDE):
+                localTemplate = localTemplate.replace("~", "_")
+            complete = all(os.path.exists(localTemplate.replace("<face>", str(face)).replace("<x>", str(x)).replace("<y>", str(y))) for face in range(6) for x in range(tileCount) for y in range(tileCount))
+            if complete:
+                keep.append(skybox)
+        if len(keep) == 0:
+            continue  # nothing complete, leave as is rather than break the sweep entirely
+        removed += len(pano.get("skyboxes", [])) - len(keep)
+        keptRes = {sb.get("resolution") for sb in keep}
+        pano["skyboxes"] = keep
+        if "resolutions" in pano:
+            pano["resolutions"] = [r for r in pano["resolutions"] if r in keptRes]
+    text = validUntilFix(json.dumps(data))
+    if CLA.getCommandLineArg(CommandLineArg.MANUAL_HOST_REPLACEMENT):
+        text = text.replace(f"https://cdn-2.{BASE_MATTERPORT_DOMAIN}", "http://127.0.0.1:8080").replace(f"https://cdn-1.{BASE_MATTERPORT_DOMAIN}", "http://127.0.0.1:8080")
+    with open(getModifiedName(srcFile), "w", encoding="UTF-8") as f:
+        f.write(text)
+    if removed:
+        consoleLog(f"Panorama resolutions with missing tiles hidden from the offline viewer: {removed} (re-run without --skip-2k-tiles later to fill them in)")
 
 
 async def downloadMainAssets(pageid, accessurl):
@@ -965,9 +1177,11 @@ async def downloadCapture(pageid):
     await downloadAttachments()
     open("api/v1/event", "a").close()
     if CLA.getCommandLineArg(CommandLineArg.MAIN_ASSET_DOWNLOAD):
-        consoleLog(f"Downloading primary model assets has 4k: {SWEEP_DO_4K}...")
+        skip2k = CLA.getCommandLineArg(CommandLineArg.SKIP_2K_TILES)
+        consoleLog(f"Downloading primary model assets has 4k: {SWEEP_DO_4K and not skip2k}{' (skipping 2k/4k panorama tiles)' if skip2k else ''}...")
         await downloadMainAssets(pageid, accessurl)
     os.chdir(THIS_MODEL_ROOT_DIR)
+    limitSweepResolutionsToDownloaded()
     generatedCrops = 0
     if CLA.getCommandLineArg(CommandLineArg.GENERATE_TILE_MESH_CROPS):
         consoleLog("Generating tile_mesh crop images locally (no progress shown)...")
@@ -1439,7 +1653,8 @@ RUN_ARGS_CONFIG_NAME = "run_args.json"
 
 
 def SetupSession(use_proxy):
-    global OUR_SESSION, MAX_CONCURRENT_REQUESTS, BASE_MATTERPORT_DOMAIN
+    global OUR_SESSION, MAX_CONCURRENT_REQUESTS, BASE_MATTERPORT_DOMAIN, RATE_LIMITER
+    RATE_LIMITER = PoliteRateLimiter()
     OUR_SESSION = requests.AsyncSession(impersonate="chrome", max_clients=MAX_CONCURRENT_REQUESTS, verify=CLA.getCommandLineArg(CommandLineArg.VERIFY_SSL), proxies=({"http": use_proxy, "https": use_proxy} if use_proxy else None), headers={"Referer": f"https://my.{BASE_MATTERPORT_DOMAIN}/", "x-matterport-application-name": "showcase"})
 
 
@@ -1619,7 +1834,7 @@ class KeyHandler:
         return url.replace(match.group(0), key_val)
 
 
-CommandLineArg = Enum("CommandLineArg", ["ADVANCED_DOWNLOAD", "PROXY", "VERIFY_SSL", "DEBUG", "CONSOLE_LOG", "TILDE", "BASE_FOLDER", "ALIAS", "DOWNLOAD", "MAIN_ASSET_DOWNLOAD", "MANUAL_HOST_REPLACEMENT", "ALWAYS_DOWNLOAD_GRAPH_REQS", "QUIET", "HELP", "ADV_HELP", "AUTO_SERVE", "FIND_URL_KEY", "FIND_URL_KEY_AND_DOWNLOAD", "REFRESH_KEY_FILES", "GENERATE_TILE_MESH_CROPS", "TITLE"])
+CommandLineArg = Enum("CommandLineArg", ["ADVANCED_DOWNLOAD", "PROXY", "VERIFY_SSL", "DEBUG", "CONSOLE_LOG", "TILDE", "BASE_FOLDER", "ALIAS", "DOWNLOAD", "MAIN_ASSET_DOWNLOAD", "MANUAL_HOST_REPLACEMENT", "ALWAYS_DOWNLOAD_GRAPH_REQS", "QUIET", "HELP", "ADV_HELP", "AUTO_SERVE", "FIND_URL_KEY", "FIND_URL_KEY_AND_DOWNLOAD", "REFRESH_KEY_FILES", "GENERATE_TILE_MESH_CROPS", "TITLE", "SKIP_2K_TILES"])
 ArgAppliesTo = Enum("ArgAppliesTo", ["DOWNLOAD", "SERVING", "BOTH"])
 
 
@@ -1754,6 +1969,8 @@ def main():
     CLA.addCommandLineArg(CommandLineArg.FIND_URL_KEY_AND_DOWNLOAD, "Like FIND_URL_KEY but saves a copy to the debug folder of the item", "", "https://my.matterport.com/api/player/models/EGxFGTFyC9N/test.file", hidden=True, allow_saved=False)
     CLA.addCommandLineArg(CommandLineArg.REFRESH_KEY_FILES, "There are about a half dozen files always downloaded as they may contain access keys we need, this prevents these from downloading", True, hidden=True, allow_saved=False)
     CLA.addCommandLineArg(CommandLineArg.GENERATE_TILE_MESH_CROPS, "Certain views like dollhouse require cropped versions of certain textures, this uses python to generate all those", True, hidden=False, allow_saved=True)
+
+    CLA.addCommandLineArg(CommandLineArg.SKIP_2K_TILES, "skip the 2k (and 4k) panorama tiles, ~4x fewer requests (helps with Matterport rate limiting) at somewhat lower panorama sharpness; panoramas whose 2k tiles are already downloaded keep them", False)
 
     CLA.addCommandLineArg(CommandLineArg.MANUAL_HOST_REPLACEMENT, "Use old style replacement of matterport URLs rather than the JS proxy, this likely only works if hosted on port 8080 after", False, hidden=True)
 
