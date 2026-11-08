@@ -1,0 +1,2 @@
+# Extra dependency for walk_tour.py only (uses your installed Google Chrome; no browser download needed)
+playwright>=1.40

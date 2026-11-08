@@ -97,6 +97,46 @@ To have it automatically start serving a specific model when you run the executa
 ## Older Download Compatibility
 There is effort put into maintaining compatibility with prior downloaded models however it is possible we may break something by mistake on older models.  Starting with the 2024-08-03 release we now copy the matterport-dl.py and JSNetProxy.js files to the folder with the download itself.  As models are meant to be completely offline hostable one downloaded this should create a point in time known-good copy even if you update matterport-dl.py later to something that breaks.  As we normally only make things better / fix features that don't work these old versions are NOT used by default when you serve up a model.  If your older model has broken and you want to use these you will need to either copy the ones from the download folder over the ones in the root of this repo.
 
+## Recovering Files from the Chrome Cache
+If a download ends up with missing files (see `known_missing.txt` in the model's download folder, often caused by 404s or Matterport rate limiting with HTTP 429), `extract_tour.py` can recover tour files Chrome already has in its disk cache. This covers tours viewed on matterport.com and tours served locally from this tool. It writes files using the same `models/<internal_id>/assets/...` layout as a normal download. It reads `run_args.json` from the folder containing the `known_missing.txt` you pass, and follows the same `--tilde` rule as matterport-dl: unless the tour was downloaded with `--tilde`, a `~` in a path is written as `_`, because that is where the local server looks. Only successful (HTTP 200) responses are kept, so cached 404 pages are skipped. It works with Chrome's "simple cache" format, which is used on macOS and Linux. Windows Chrome uses a different cache format and is not supported.
+
+You need two IDs: the share ID (the `?m=` value in the tour URL, which is also the download folder name) and the 32-character internal model ID (the folder name under `downloads/<share_id>/models/`). Chrome keeps one cache per profile:
+- macOS: `~/Library/Caches/Google/Chrome/<Profile>/Cache/Cache_Data`
+- Linux: `~/.cache/google-chrome/<Profile>/Cache/Cache_Data`
+
+`<Profile>` is `Default`, `Profile 1`, and so on. Pass every profile you viewed the tour in. Example on macOS:
+```bash
+C=~/Library/Caches/Google/Chrome
+python3 extract_tour.py ~/Desktop/xb99ucgvFAH_from_cache \
+    downloads/xb99ucgvFAH/known_missing.txt \
+    xb99ucgvFAH,526e8eb5ea624fe99a68df9dedd5a9fe \
+    "$C/Default/Cache/Cache_Data" "$C/Profile 1/Cache/Cache_Data"
+```
+The arguments are: output folder, the `known_missing.txt` file (used only to report how many missing files were recovered, and it does not need to exist), the IDs separated by commas, then one or more cache folders. The script only uses the Python standard library. The output goes to a separate folder so you can review it first. Then merge it into the download without overwriting existing files:
+```bash
+rsync -a --ignore-existing --itemize-changes --stats ~/Desktop/xb99ucgvFAH_from_cache/ downloads/xb99ucgvFAH/
+```
+`--itemize-changes` prints one line per file copied. Lines starting with `>f+++` are new files, and lines starting with `cd+++` are new folders. `--stats` ends with a summary: "Number of (regular) files transferred" is how many new files were added. The exact wording varies slightly between GNU rsync and the openrsync that ships with macOS. Add `--dry-run` to preview without copying. To count the new 2k panorama tiles per panorama folder:
+```bash
+rsync -a --ignore-existing -i ~/Desktop/xb99ucgvFAH_from_cache/ downloads/xb99ucgvFAH/ \
+    | grep '^>f.*2k_face' | awk '{print $2}' | xargs -n1 dirname | sort | uniq -c
+```
+The cache only has what your browser actually loaded and Chrome evicts old entries over time, so run this soon after viewing the tour. The cache cannot supply files the browser never received.
+
+## Walking a Tour to Fill Missing Panorama Tiles
+`walk_tour.py` opens a downloaded tour on my.matterport.com in your installed Google Chrome. It visits each sweep (panorama position) in turn and looks all the way around: three full turns, one level and one each tilted up and down. That makes the viewer load every high-resolution tile. Each new model asset the browser receives is saved straight into `downloads/<share_id>/` in the normal layout, and existing files are never overwritten. Like matterport-dl, it writes `~` paths as `_` unless the download's `run_args.json` has `TILDE` enabled, and it counts only the tile folder the local server actually serves. So when it reports a sweep as complete, the served tour has every tile. The viewer will not tilt far enough to show the middle 4 tiles of the face directly overhead, so after looking around the walker requests any tiles still missing for that sweep directly, reusing the signed link from tiles the viewer just loaded. Pass `--no-fetch-unviewable` to turn this off. Sweeps that already have every tile are skipped, so you can re-run it safely.
+
+It needs Playwright, which is not part of the main requirements:
+```bash
+venv/bin/pip install -r requirements-walker.txt
+```
+The tour must already have been downloaded once, because the list of sweeps is read from the download. Usage:
+```bash
+venv/bin/python walk_tour.py xb99ucgvFAH                       # all incomplete sweeps
+venv/bin/python walk_tour.py xb99ucgvFAH --sweeps 4,41 --headed # specific sweeps, visible window
+```
+Options: `--level 2k|1k|512` sets the resolution to complete (default `2k`), `--passes N` sets the maximum number of look-around passes per sweep (default 2), and `--include-complete` also visits sweeps that are already complete. While it runs it prints, for each sweep, how long it took to load, one line per look-around pass (`-v` adds a line per move), and the result (`OK`, `INCOMPLETE`, `FAILED` or `STOPPED`). Each line counts files saved, successful Matterport responses, HTTP errors and network failures, for example `pass 1: saved 4, 191 ok | HTTP 404x2`. HTTP 403, 429, server errors and network failures are printed as soon as they happen. If Matterport rate limits (HTTP 429), the walk stops, prints the `Retry-After` wait if the server sent one, and exits with code 75. Wait (often about an hour) and run the same command again; finished sweeps are skipped. Pass `--keep-going` to continue through rate limiting instead. It finishes with a summary and a list of tiles that are still missing. Sweep indexes match the `index` field in `api/mp/models/graph_GetShowcaseSweeps.json`. Showcase's `ss=` link parameter counts from 1, so sweep 4 opens with `ss=5`. Each sweep takes a minute or two.
+
 # Additional Notes
 * It is possible to host these Matterport archives using standard web servers however: 1) Certain features beyond the tour itself may not work.  2)  #1 may be fixable by specific rewrite rules for apache/nginx.  These are not currently provided but if you look at `OurSimpleHTTPRequestHandler` class near the bottom of the source file you can likely figure out what redirects we do.
 

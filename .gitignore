@@ -2,3 +2,12 @@
 downloads/
 output/
 defaults.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Local run logs and Claude Code notes
+walk.log
+.claude/
