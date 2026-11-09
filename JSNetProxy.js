@@ -1,5 +1,19 @@
 
 const _hostRegex = new RegExp( /(https?:\/\/[^/]+)/,"i");
+
+// Sub-path hosting (ie https://host/tours/xb99/): the folder holding index.html is the tour root.
+// _ProxyPrefix is "" when served at the site root (run.py), so behaviour there is unchanged.
+window._ProxyPrefix = window.location.pathname.replace(/[^/]*$/, "").replace(/\/$/, "");
+if (window._ProxyBase === window.location.origin)
+	window._ProxyBase = window.location.origin + window._ProxyPrefix;
+
+function _addPrefix(path) {
+	const prefix = window._ProxyPrefix;
+	if (!prefix || path === prefix || path.startsWith(prefix + "/"))
+		return path;
+	return prefix + path;
+}
+
 window._replaceHost = function(str){
 	if (! str)
 		return str;
@@ -14,6 +28,18 @@ window._replaceHost = function(str){
 
 	if (window._NoTilde)
 		str = str.replace("~","_")
+	// Root-absolute path like "/api/mp/models/graph": keep it inside the tour folder.
+	if (str.startsWith("/") && !str.startsWith("//"))
+		return _addPrefix(str);
+	const hostMatch = str.match(_hostRegex);
+	if (hostMatch && hostMatch[1].toLowerCase() === window.location.origin.toLowerCase()) {
+		// Already pointing at this server (ie a Request resolved from a root-absolute path).
+		const start = str.indexOf(hostMatch[1]) + hostMatch[1].length;
+		const rest = str.slice(start);
+		if (!rest.startsWith("/"))
+			return str;
+		return str.slice(0, start) + _addPrefix(rest);
+	}
 	return str.replace(_hostRegex,window._ProxyBase);
 }
 window.nv_XMLHttpRequest = new Proxy(XMLHttpRequest, {
