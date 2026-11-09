@@ -134,6 +134,10 @@ The tour must already have been downloaded once, because the list of sweeps is r
 ```bash
 venv/bin/python walk_tour.py xb99ucgvFAH                       # all incomplete sweeps
 venv/bin/python walk_tour.py xb99ucgvFAH --sweeps 4,41 --headed # specific sweeps, visible window
+
+cd /Users/wh/Desktop/WH/mport/matterport-dl
+caffeinate -dims venv/bin/python -u walk_tour.py xb99ucgvFAH --passes 1 2>&1 | tee -a walk.log
+
 ```
 Options: `--level 2k|1k|512` sets the resolution to complete (default `2k`), `--passes N` sets the maximum number of look-around passes per sweep (default 2), and `--include-complete` also visits sweeps that are already complete. While it runs it prints, for each sweep, how long it took to load, one line per look-around pass (`-v` adds a line per move), and the result (`OK`, `INCOMPLETE`, `FAILED` or `STOPPED`). Each line counts files saved, successful Matterport responses, HTTP errors and network failures, for example `pass 1: saved 4, 191 ok | HTTP 404x2`. HTTP 403, 429, server errors and network failures are printed as soon as they happen. If Matterport rate limits (HTTP 429), the walk stops, prints the `Retry-After` wait if the server sent one, and exits with code 75. Wait (often about an hour) and run the same command again; finished sweeps are skipped. Pass `--keep-going` to continue through rate limiting instead. It finishes with a summary and a list of tiles that are still missing. Sweep indexes match the `index` field in `api/mp/models/graph_GetShowcaseSweeps.json`. Showcase's `ss=` link parameter counts from 1, so sweep 4 opens with `ss=5`. Each sweep takes a minute or two.
 
@@ -143,5 +147,8 @@ Options: `--level 2k|1k|512` sets the resolution to complete (default `2k`), `--
 * As improvements are made to the script you can often upgrade old archives but simply running the script again.  Any existing files downloaded are generally skipped so it will run much faster.  This is not a guarantee so backup your important archives first.
 
 * As matterport changes their code things will likely need to be updated in the script. A good place to start is looking at the server.log file for any lines that say "404 error" in them, these are likely additional files we need to download for the archive to work.
+
+cd /Users/wh/Desktop/WH/mport/matterport-dl
+/opt/homebrew/bin/python3.12 run.py HeJ4pjFwEeG  --skip-2k-tiles --no-skip-2k-tiles
 
 # [Reddit thread](https://www.reddit.com/r/DataHoarder/comments/nycjj4/release_matterportdl_a_tool_for_archiving/)

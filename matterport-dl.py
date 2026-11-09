@@ -448,7 +448,8 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
 
 
 def validUntilFix(text):
-    return re.sub(r"validUntil\"\s*:\s*\"20[\d]{2}-[\d]{2}-[\d]{2}T", 'validUntil":"2099-01-01T', text)
+    # Also matches the backslash-escaped form (validUntil\":\"...) used in JSON embedded in index.html.
+    return re.sub(r"validUntil(\\?\")\s*:\s*(\\?\")20[\d]{2}-[\d]{2}-[\d]{2}T", r"validUntil\1:\g<2>2099-01-01T", text)
 
 
 async def downloadGraphModels(pageid):
@@ -1591,10 +1592,25 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
     def do_GraphRequest(self, option_name: str):
         post_msg = None
         logLevel = logging.INFO
+        if option_name in GRAPH_SERVED_FROM:
+            # Answered from another saved query whose reply contains every field this one asks for.
+            option_name = GRAPH_SERVED_FROM[option_name]
+        if option_name not in GRAPH_DATA_REQ:
+            # Always answer: an unanswered request leaves the viewer's fetch failing, which can stall loading.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"data": {"model": null}}')
+            consoleDebugLog(f"graph for operationName: {option_name} is not saved, returning an empty model", loglevel=logging.WARNING)
+            return
         if option_name in GRAPH_DATA_REQ:
             self.send_response(200)
             self.end_headers()
             file_path = f"api/mp/models/graph_{option_name}.json"
+            # The modified copy has validUntil pushed to 2099; the original's asset links expire within
+            # a day, after which the viewer asks Matterport for fresh ones and never finishes loading.
+            if os.path.exists(getModifiedName(file_path)):
+                file_path = getModifiedName(file_path)
             if os.path.exists(file_path):
                 with open(file_path, "r", encoding="UTF-8") as f:
                     self.wfile.write(f.read().encode("utf-8"))
@@ -1634,6 +1650,11 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
             return "text/html; charset=UTF-8"
         return res
 
+
+# Graph queries the viewer may send that we answer with another saved query's reply (a superset of the fields).
+GRAPH_SERVED_FROM = {
+    "GetModelAssets": "GetModelDetails",
+}
 
 GRAPH_DATA_REQ = {
     "GetModelDetails": "?operationName=GetModelDetails&variables=%7B%22modelId%22%3A%22[MATTERPORT_MODEL_ID]%22%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%22012c3d36cdf890ba8e49dfd66b1072a2dbb573e672d72482eff86a2563530f46%22%7D%7D",
